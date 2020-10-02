@@ -22,6 +22,7 @@
 #include "glsl_compiler.h"
 #include "platform/filesystem.h"
 #include "platform/platform.h"
+#include <stb_image_write.h>
 
 #if defined(VKB_DEBUG) || defined(VKB_VALIDATION_LAYERS)
 /// @brief A debug callback called from Vulkan validation layers.
@@ -337,6 +338,13 @@ void HelloTriangle::init_device(Context &                        context,
 	volkLoadDevice(context.device);
 
 	vkGetDeviceQueue(context.device, context.graphics_queue_index, 0, &context.queue);
+
+
+  VmaAllocatorCreateInfo allocatorInfo = {};
+  allocatorInfo.physicalDevice = context.gpu;
+  allocatorInfo.device = context.device;
+  allocatorInfo.instance = context.instance;
+  VK_CHECK(vmaCreateAllocator(&allocatorInfo, &context.memory_allocator));
 }
 
 /**
@@ -547,6 +555,7 @@ void HelloTriangle::init_swapchain(Context &context)
 		}
 
 		context.swapchain_image_views.clear();
+    context.swapchain_images.clear();
 
 		vkDestroySwapchainKHR(context.device, old_swapchain, nullptr);
 	}
@@ -557,8 +566,8 @@ void HelloTriangle::init_swapchain(Context &context)
 	VK_CHECK(vkGetSwapchainImagesKHR(context.device, context.swapchain, &image_count, nullptr));
 
 	/// The swapchain images.
-	std::vector<VkImage> swapchain_images(image_count);
-	VK_CHECK(vkGetSwapchainImagesKHR(context.device, context.swapchain, &image_count, swapchain_images.data()));
+  context.swapchain_images.resize(image_count);
+	VK_CHECK(vkGetSwapchainImagesKHR(context.device, context.swapchain, &image_count, context.swapchain_images.data()));
 
 	// Initialize per-frame resources.
 	// Every swapchain image has its own command pool and fence manager.
@@ -577,7 +586,7 @@ void HelloTriangle::init_swapchain(Context &context)
 		VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
 		view_info.viewType                    = VK_IMAGE_VIEW_TYPE_2D;
 		view_info.format                      = context.swapchain_dimensions.format;
-		view_info.image                       = swapchain_images[i];
+		view_info.image                       = context.swapchain_images[i];
 		view_info.subresourceRange.levelCount = 1;
 		view_info.subresourceRange.layerCount = 1;
 		view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -597,11 +606,11 @@ void HelloTriangle::init_swapchain(Context &context)
  * @brief Initializes the Vulkan render pass.
  * @param context A Vulkan context with a device already set up.
  */
-void HelloTriangle::init_render_pass(Context &context)
+void HelloTriangle::init_render_pass(Context &context, VkRenderPass& renderPass, VkFormat renderTargetFormat)
 {
 	VkAttachmentDescription attachment = {0};
 	// Backbuffer format.
-	attachment.format = context.swapchain_dimensions.format;
+	attachment.format = renderTargetFormat;
 	// Not multisampled.
 	attachment.samples = VK_SAMPLE_COUNT_1_BIT;
 	// When starting the frame, we want tiles to be cleared.
@@ -655,7 +664,7 @@ void HelloTriangle::init_render_pass(Context &context)
 	rp_info.dependencyCount        = 1;
 	rp_info.pDependencies          = &dependency;
 
-	VK_CHECK(vkCreateRenderPass(context.device, &rp_info, nullptr, &context.render_pass));
+	VK_CHECK(vkCreateRenderPass(context.device, &rp_info, nullptr, &renderPass));
 }
 
 /**
@@ -699,12 +708,15 @@ VkShaderModule HelloTriangle::load_shader_module(Context &context, const char *p
  * @brief Initializes the Vulkan pipeline.
  * @param context A Vulkan context with a device and a render pass already set up.
  */
-void HelloTriangle::init_pipeline(Context &context)
+void HelloTriangle::init_pipeline(Context &context, VkPipeline& pipeline, VkRenderPass renderPass)
 {
 	// Create a blank pipeline layout.
 	// We are not binding any resources to the pipeline in this first sample.
-	VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-	VK_CHECK(vkCreatePipelineLayout(context.device, &layout_info, nullptr, &context.pipeline_layout));
+  if (!context.pipeline_layout)
+  {
+    VkPipelineLayoutCreateInfo layout_info{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VK_CHECK(vkCreatePipelineLayout(context.device, &layout_info, nullptr, &context.pipeline_layout));
+  }
 
 	VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
 
@@ -773,10 +785,10 @@ void HelloTriangle::init_pipeline(Context &context)
 	pipe.pDynamicState       = &dynamic;
 
 	// We need to specify the pipeline layout and the render pass description up front as well.
-	pipe.renderPass = context.render_pass;
+	pipe.renderPass = renderPass;
 	pipe.layout     = context.pipeline_layout;
 
-	VK_CHECK(vkCreateGraphicsPipelines(context.device, VK_NULL_HANDLE, 1, &pipe, nullptr, &context.pipeline));
+	VK_CHECK(vkCreateGraphicsPipelines(context.device, VK_NULL_HANDLE, 1, &pipe, nullptr, &pipeline));
 
 	// Pipeline is baked, we can delete the shader modules now.
 	vkDestroyShaderModule(context.device, shader_stages[0].module, nullptr);
@@ -843,15 +855,187 @@ VkResult HelloTriangle::acquire_next_image(Context &context, uint32_t *image)
 	return VK_SUCCESS;
 }
 
+void HelloTriangle::save_image(Context& context, VkImage image, int32_t w, int32_t h, const std::string& path)
+{
+  vkDeviceWaitIdle(context.device);
+
+
+  VkBuffer scratchBuffer = VK_NULL_HANDLE;
+  VmaAllocation bufferMemory = VK_NULL_HANDLE;
+  {
+
+    VkBufferUsageFlags bufferUsageFlags = 0;
+    VmaMemoryUsage memoryUsage = VMA_MEMORY_USAGE_UNKNOWN;
+
+    //if (this->usage.transferType.contains(Usage::TransferType::Source))
+    bufferUsageFlags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    //if (this->usage.transferType.contains(Usage::TransferType::Dest))
+    bufferUsageFlags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+    /*switch (this->usage.usageType)
+    {
+    case Usage::UsageType::Index:
+      bufferUsageFlags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+      break;
+    case Usage::UsageType::Vertex:
+      bufferUsageFlags |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+      break;
+    case Usage::UsageType::Uniform:
+      bufferUsageFlags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+      break;
+    case Usage::UsageType::None:
+      break;
+    }*/
+
+    //if (this->options.format != BufferFormat::Unknown)
+    bufferUsageFlags |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+
+    /*switch (this->usage.memoryType)
+    {
+    case Usage::MemoryType::GpuOnly:
+      memoryUsage = VMA_MEMORY_USAGE_GPU_ONLY;
+      break;
+    case Usage::MemoryType::Upload:
+      memoryUsage = VMA_MEMORY_USAGE_CPU_ONLY;
+      break;
+    case Usage::MemoryType::SmallFastMappable:
+      memoryUsage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+      break;
+    case Usage::MemoryType::Readback:*/
+    memoryUsage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+    /* break;
+   }*/
+
+    VkBufferCreateInfo stagingBufferInfo = {};
+    stagingBufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingBufferInfo.size = w * h * 4;
+    stagingBufferInfo.usage = bufferUsageFlags;
+    stagingBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    stagingBufferInfo.queueFamilyIndexCount = 1;
+    stagingBufferInfo.pQueueFamilyIndices = (uint32_t*)&context.graphics_queue_index; //&this->graphics->graphicsQueue.familyIndex;
+
+    VmaAllocationCreateInfo allocInfo = {};
+    allocInfo.usage = memoryUsage;
+    VkResult result = vmaCreateBuffer(context.memory_allocator, &stagingBufferInfo, &allocInfo, &scratchBuffer, &bufferMemory, nullptr);
+    VK_CHECK(result);
+  }
+
+  VkCommandPool commandPool = VK_NULL_HANDLE;
+  {
+    VkCommandPoolCreateInfo poolCreateInfo = {};
+    poolCreateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolCreateInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolCreateInfo.queueFamilyIndex = context.graphics_queue_index;
+
+    vkCreateCommandPool(context.device, &poolCreateInfo, nullptr, &commandPool);
+  }
+
+  VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+  {
+    VkCommandBufferAllocateInfo commandBufferInfo = {};
+    commandBufferInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    commandBufferInfo.commandPool = commandPool;
+    commandBufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    commandBufferInfo.commandBufferCount = 1;
+    vkAllocateCommandBuffers(context.device, &commandBufferInfo, &commandBuffer);
+  }
+
+  VkCommandBufferBeginInfo beginInfo = {};
+  beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
+
+  {
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = 0;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = context.graphics_queue_index;
+    barrier.dstQueueFamilyIndex = context.graphics_queue_index;
+    barrier.image = image;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.layerCount = 1;
+
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VkPipelineStageFlags sourceStage = 0;
+    VkPipelineStageFlags destStage = 0;
+
+    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    sourceStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    destStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer,
+      sourceStage,
+      destStage,
+      0,
+      0, nullptr,
+      0, nullptr,
+      1, &barrier);
+  }
+
+  {
+    VkBufferImageCopy copy = {};
+    copy.bufferOffset = 0;
+    copy.bufferRowLength = w;
+    copy.bufferImageHeight = h;
+
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.mipLevel = 0;
+    copy.imageSubresource.layerCount = 1;
+
+    copy.imageOffset.x = 0;
+    copy.imageOffset.y = 0;
+
+    copy.imageExtent.width = w;
+    copy.imageExtent.height = h;
+    copy.imageExtent.depth = 1;
+
+    vkCmdCopyImageToBuffer(commandBuffer, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratchBuffer, 1, &copy);
+  }
+
+  {
+    vkEndCommandBuffer(commandBuffer);
+
+    VkPipelineStageFlags waitStageFlags = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 0;
+    submitInfo.pWaitSemaphores = nullptr;
+    submitInfo.pWaitDstStageMask = &waitStageFlags;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    vkQueueSubmit(context.queue, 1, &submitInfo, nullptr);
+
+    vkDeviceWaitIdle(context.device);
+  }
+
+  void* mappedPointer = nullptr;
+  VK_CHECK(vmaMapMemory(context.memory_allocator, bufferMemory, &mappedPointer));
+  vmaInvalidateAllocation(context.memory_allocator, bufferMemory, 0, VK_WHOLE_SIZE);
+
+  stbi_write_png(path.c_str(), w, h, 4, mappedPointer, w * 4);
+
+  vmaUnmapMemory(context.memory_allocator, bufferMemory);
+
+
+  vkFreeCommandBuffers(context.device, commandPool, 1, &commandBuffer);
+  vkDestroyCommandPool(context.device, commandPool, nullptr);
+  vmaDestroyBuffer(context.memory_allocator, scratchBuffer, bufferMemory);
+}
+
+
 /**
  * @brief Renders a triangle to the specified swapchain image.
  * @param context A Vulkan context set up for rendering.
  * @param swapchain_index The swapchain index for the image being rendered.
  */
-void HelloTriangle::render_triangle(Context &context, uint32_t swapchain_index)
+void HelloTriangle::render_triangle(Context &context, VkPipeline pipeline, VkRenderPass renderPass, uint32_t swapchain_index, VkFramebuffer framebuffer)
 {
-	// Render to this framebuffer.
-	VkFramebuffer framebuffer = context.swapchain_framebuffers[swapchain_index];
 
 	// Allocate or re-use a primary command buffer.
 	VkCommandBuffer cmd = context.per_frame[swapchain_index].primary_command_buffer;
@@ -868,7 +1052,7 @@ void HelloTriangle::render_triangle(Context &context, uint32_t swapchain_index)
 
 	// Begin the render pass.
 	VkRenderPassBeginInfo rp_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-	rp_begin.renderPass               = context.render_pass;
+	rp_begin.renderPass               = renderPass;
 	rp_begin.framebuffer              = framebuffer;
 	rp_begin.renderArea.extent.width  = context.swapchain_dimensions.width;
 	rp_begin.renderArea.extent.height = context.swapchain_dimensions.height;
@@ -878,7 +1062,7 @@ void HelloTriangle::render_triangle(Context &context, uint32_t swapchain_index)
 	vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
 	// Bind the graphics pipeline.
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, context.pipeline);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
 	VkViewport vp{};
 	vp.width    = static_cast<float>(context.swapchain_dimensions.width);
@@ -996,6 +1180,8 @@ void HelloTriangle::teardown(Context &context)
 	// Don't release anything until the GPU is completely idle.
 	vkDeviceWaitIdle(context.device);
 
+  vmaDestroyAllocator(context.memory_allocator);
+
 	teardown_framebuffers(context);
 
 	for (auto &per_frame : context.per_frame)
@@ -1015,6 +1201,11 @@ void HelloTriangle::teardown(Context &context)
 		vkDestroyPipeline(context.device, context.pipeline, nullptr);
 	}
 
+  if (context.pipeline_rgba8 != VK_NULL_HANDLE)
+  {
+    vkDestroyPipeline(context.device, context.pipeline_rgba8, nullptr);
+  }
+
 	if (context.pipeline_layout != VK_NULL_HANDLE)
 	{
 		vkDestroyPipelineLayout(context.device, context.pipeline_layout, nullptr);
@@ -1024,6 +1215,11 @@ void HelloTriangle::teardown(Context &context)
 	{
 		vkDestroyRenderPass(context.device, context.render_pass, nullptr);
 	}
+
+  if (context.render_pass_rgba8 != VK_NULL_HANDLE)
+  {
+    vkDestroyRenderPass(context.device, context.render_pass_rgba8, nullptr);
+  }
 
 	for (VkImageView image_view : context.swapchain_image_views)
 	{
@@ -1068,7 +1264,7 @@ HelloTriangle::~HelloTriangle()
 
 bool HelloTriangle::prepare(vkb::Platform &platform)
 {
-	init_instance(context, {VK_KHR_SURFACE_EXTENSION_NAME}, {});
+	init_instance(context, {VK_KHR_SURFACE_EXTENSION_NAME}, {"VK_LAYER_KHRONOS_validation"});
 
 	vk_instance = std::make_unique<vkb::Instance>(context.instance);
 
@@ -1079,8 +1275,11 @@ bool HelloTriangle::prepare(vkb::Platform &platform)
 	init_swapchain(context);
 
 	// Create the necessary objects for rendering.
-	init_render_pass(context);
-	init_pipeline(context);
+	init_render_pass(context, context.render_pass, context.swapchain_dimensions.format);
+  init_render_pass(context, context.render_pass_rgba8, VK_FORMAT_R8G8B8A8_UNORM);
+	init_pipeline(context, context.pipeline, context.render_pass);
+  init_pipeline(context, context.pipeline_rgba8, context.render_pass_rgba8);
+
 	init_framebuffers(context);
 
 	return true;
@@ -1105,8 +1304,78 @@ void HelloTriangle::update(float delta_time)
 		return;
 	}
 
-	render_triangle(context, index);
-	res = present_image(context, index);
+  static bool do_save_image = true;
+
+  if (do_save_image)
+  {
+    VkImage tempImage = VK_NULL_HANDLE;
+    VmaAllocation tempImageMemory = VK_NULL_HANDLE;
+    VkImageView tempImageView = VK_NULL_HANDLE;
+
+    {
+      VkImageCreateInfo textureInfo = {};
+      textureInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+      textureInfo.imageType = VK_IMAGE_TYPE_2D;
+      textureInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+      textureInfo.extent.width = context.swapchain_dimensions.width;
+      textureInfo.extent.height = context.swapchain_dimensions.height;
+      textureInfo.extent.depth = 1;
+      textureInfo.mipLevels = 1;
+      textureInfo.arrayLayers = 1;
+      textureInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+      textureInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+      textureInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      textureInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      textureInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+
+      VmaAllocationCreateInfo allocationInfo = {};
+      allocationInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+      VkResult result = vmaCreateImage(context.memory_allocator, &textureInfo, &allocationInfo, &tempImage, &tempImageMemory, nullptr);
+      VK_CHECK(result);
+
+
+      VkImageViewCreateInfo imageViewInfo = {};
+      imageViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+      imageViewInfo.image = tempImage;
+      imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+      imageViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+      imageViewInfo.subresourceRange.layerCount = 1;
+      imageViewInfo.subresourceRange.levelCount = 1;
+      imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+      VK_CHECK(vkCreateImageView(context.device, &imageViewInfo, nullptr, &tempImageView));
+    }
+
+    VkFramebuffer framebufferTmp = nullptr;
+    {
+      VkFramebufferCreateInfo framebufferInfo = {};
+      framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+      framebufferInfo.renderPass = context.render_pass_rgba8;
+      framebufferInfo.attachmentCount = 1;
+      framebufferInfo.pAttachments = &tempImageView;
+      framebufferInfo.width = context.swapchain_dimensions.width,
+      framebufferInfo.height = context.swapchain_dimensions.height,
+      framebufferInfo.layers = 1;
+      VK_CHECK(vkCreateFramebuffer(context.device, &framebufferInfo, nullptr, &framebufferTmp));
+    }
+
+    render_triangle(context, context.pipeline_rgba8, context.render_pass_rgba8, index, framebufferTmp);
+
+    save_image(context, tempImage, context.swapchain_dimensions.width, context.swapchain_dimensions.height, "c:/users/wheybags/desktop/triangle.png");
+
+    vkDestroyFramebuffer(context.device, framebufferTmp, nullptr);
+    vkDestroyImageView(context.device, tempImageView, nullptr);
+    vmaDestroyImage(context.memory_allocator, tempImage, tempImageMemory);
+
+    do_save_image = false;
+  }
+  else
+  {
+    render_triangle(context, context.pipeline, context.render_pass, index, context.swapchain_framebuffers[index]);
+    res = present_image(context, index);
+  }
+
 
 	// Handle Outdated error in present.
 	if (res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR)

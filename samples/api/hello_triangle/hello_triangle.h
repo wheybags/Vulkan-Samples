@@ -92,6 +92,7 @@ class HelloTriangle : public vkb::Application
 		int32_t graphics_queue_index = -1;
 
 		/// The image view for each swapchain image.
+    std::vector<VkImage> swapchain_images;
 		std::vector<VkImageView> swapchain_image_views;
 
 		/// The framebuffer for each swapchain image view.
@@ -99,9 +100,11 @@ class HelloTriangle : public vkb::Application
 
 		/// The renderpass description.
 		VkRenderPass render_pass = VK_NULL_HANDLE;
+    VkRenderPass render_pass_rgba8 = VK_NULL_HANDLE;
 
 		/// The graphics pipeline.
 		VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline pipeline_rgba8 = VK_NULL_HANDLE;
 
 		/**
 		 * The pipeline layout for resources.
@@ -117,6 +120,9 @@ class HelloTriangle : public vkb::Application
 
 		/// A set of per-frame data.
 		std::vector<PerFrame> per_frame;
+
+
+    VmaAllocator memory_allocator{ VK_NULL_HANDLE };
 	};
 
   public:
@@ -151,15 +157,15 @@ class HelloTriangle : public vkb::Application
 
 	void init_swapchain(Context &context);
 
-	void init_render_pass(Context &context);
+  void init_render_pass(Context &context, VkRenderPass& renderPass, VkFormat renderTargetFormat);
 
 	VkShaderModule load_shader_module(Context &context, const char *path);
 
-	void init_pipeline(Context &context);
+	void init_pipeline(Context &context, VkPipeline& pipeline, VkRenderPass renderPass);
 
 	VkResult acquire_next_image(Context &context, uint32_t *image);
 
-	void render_triangle(Context &context, uint32_t swapchain_index);
+	void render_triangle(Context &context, VkPipeline pipeline, VkRenderPass renderPass, uint32_t swapchain_index, VkFramebuffer framebuffer);
 
 	VkResult present_image(Context &context, uint32_t index);
 
@@ -168,6 +174,8 @@ class HelloTriangle : public vkb::Application
 	void teardown_framebuffers(Context &context);
 
 	void teardown(Context &context);
+
+  void save_image(Context& context, VkImage image, int32_t w, int32_t h, const std::string& path);
 
   private:
 	Context context;
